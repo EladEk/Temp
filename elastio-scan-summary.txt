@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+# elastio-scan-summary.sh - summarise the reports written by `elastio iscan`.
+#
+#   ./elastio-scan-summary.sh <reports-dir>          summarise every run found
+#   ./elastio-scan-summary.sh <reports-dir> --csv    machine-readable
+#   ./elastio-scan-summary.sh <reports-dir> --files  also list the affected paths
+#   ./elastio-scan-summary.sh --help
+#
+# <reports-dir> is the directory passed to `iscan --reports-dir`.
+#
+# Needs only bash, coreutils, grep and awk. Nothing to install on Ubuntu.
+#
+# Why this exists: the summary the CLI prints when a run finishes comes from an
+# earlier version of the encryption detector, and does not reflect what the
+# current detector wrote to the report files. This reads the current reports and
+# gives you the totals without opening a file.
+#
+# Counting rules:
+#   * "Encryption (including corruption)" is one figure. Externally both are
+#     files that no longer open, and a file is one or the other, never both,
+#     so the two never double-count.
+#   * "Affected files (unique)" is the deduplicated union of ALL THREE
+#     detectors. The ransomware set overlaps the encryption set without being
+#     contained by it, so adding the rows overcounts and reading only the
+#     encryption row undercounts.
+#   * the *-encr-v2.* reports are the source of truth. The older -encr.json
+#     comes from the earlier detector and is ignored.
+
+set -uo pipefail
+shopt -s nullglob
+
+CSV=0
+LIST=0
+DIR=
+
+# The ransomware engine will not name a family below these. They are engine
+# behaviour, not script settings - see the "no ransomware named" note below.
+MIN_RANS_FILES=20
+MIN_RANS_BYTES=8192
+MIN_RANS_DIRS=5
+
+usage() { sed -n '2,${/^#/!q;p;}' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+while (($#)); do
+  case "$1" in
+    --csv)         CSV=1 ;;
+    --files)       LIST=1 ;;
+    -h|--help)     usage 0 ;;
+    -*)            echo "unknown option: $1" >&2; usage 1 ;;
+    *)             DIR="$1" ;;
+  esac
+  shift
+done
+
+[[ -n "$DIR" ]] || usage 1
+[[ -d "$DIR" ]] || { echo "not a directory: $DIR" >&2; exit 1; }
+
+# count <fixed-string> <file> -> number of occurrences, 0 if the file is absent.
+#
+# grep -o, not grep -c: -c counts matching LINES, and the malware and ransomware
+# reports are compact single-line JSON, so -c would answer 1 however many
+# findings they hold. The v2 files are pretty-printed and would survive -c, but
+# one counter that is right everywhere beats two that are each right somewhere.
+count() {
+  [[ -f "${2:-}" ]] || { echo 0; return; }
+  local n; n=$(grep -oF -- "$1" "$2" 2>/dev/null | wc -l | tr -d ' ')
+  echo "${n:-0}"
+}
+
+# num <key> <file> -> first value for that key, integer or decimal
+num() {
+  [[ -f "${2:-}" ]] || return 1
+  local v; v=$(grep -o "\"$1\": *[0-9.]\+" "$2" 2>/dev/null | head -1 | sed 's/.*: *//')
+  [[ -n "$v" ]] || return 1
+  echo "$v"
+}
+
+# secs <file> -> seconds between "started" and "finished", one decimal place
+secs() {
+  [[ -f "${1:-}" ]] || return 1
+  local s f a b
+  s=$(grep -o '"started": *"[^"]*"' "$1" 2>/dev/null | head -1 | sed 's/.*: *"//; s/"$//')
+  f=$(grep -o '"finished": *"[^"]*"' "$1" 2>/dev/null | head -1 | sed 's/.*: *"//; s/"$//')
+  [[ -n "$s" && -n "$f" ]] || return 1
+  a=$(date -d "$s" +%s.%N 2>/dev/null) || return 1
+  b=$(date -d "$f" +%s.%N 2>/dev/null) || return 1
+  awk -v a="$a" -v b="$b" 'BEGIN{ printf "%.1f", b-a }'
+}
+
+# affected_paths <encrypted-file> <corruption-file> <ransomware-file>
+#   -> deduplicated union of every affected path
+#
+# All three detectors, not just the encryption pair. The ransomware set overlaps
+# the encrypted set without being contained by it, so a file flagged only by the
+# ransomware engine is still an affected file and has to be in the total. Union
+# rather than sum, because most files flagged by ransomware are also encrypted
+# and must count once.
+affected_paths() {
+  { [[ -f "${1:-}" ]] && grep -o '"filename": *"[^"]*"' "$1" | sed 's/.*"filename": *"//; s/"$//'
+    [[ -f "${2:-}" ]] && grep -o '"filename": *"[^"]*"' "$2" | sed 's/.*"filename": *"//; s/"$//'
+    # The scan target's own entry carries a path but no suspected_rans, so
+    # requiring the pair excludes it.
+    [[ -f "${3:-}" ]] && grep -o '"path":"[^"]*","suspected_rans"' "$3" |
+      sed 's/"path":"//; s/","suspected_rans"//'
+  } 2>/dev/null | sort -u
+}
+
+# rans_ready <encrypted-file> -> "<files-over-8k> <directories>"
+# How much of the encrypted set would count toward the ransomware engine's
+# volume thresholds. file_size precedes decision in every record.
+rans_ready() {
+  [[ -f "${1:-}" ]] || { echo "0 0"; return; }
+  awk -v min="$MIN_RANS_BYTES" '
+    /"filename": *"/ { p=$0; sub(/.*"filename": *"/,"",p); sub(/".*/,"",p) }
+    /"file_size":/   { s=$0; gsub(/[^0-9]/,"",s); sz=s+0 }
+    /"decision": *"Encrypted"/ {
+      if (sz > min) { n++; d=p; sub(/\/[^\/]*$/,"",d); dirs[d]=1 }
+    }
+    END { c=0; for (k in dirs) c++; printf "%d %d", n+0, c }' "$1" 2>/dev/null
+}
+
+pct() { awk -v a="$1" -v b="${2:-0}" 'BEGIN{ if (b+0==0) print "n/a"; else printf "%.1f%%", 100*a/b }'; }
+
+# Every run in the directory, identified by the timestamp in the filename.
+mapfile -t RUNS < <(
+  for f in "$DIR"/*-encr-v2.stats.json "$DIR"/*-stats.json "$DIR"/*-rans.json; do
+    [[ -f "$f" ]] && basename "$f" | grep -o '[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}T[0-9]\{2\}-[0-9]\{2\}-[0-9]\{2\}Z'
+  done | sort -u
+)
+
+((${#RUNS[@]})) || { echo "no elastio iscan reports found in: $DIR" >&2; exit 1; }
+
+((CSV)) && echo "scan,files_scanned,ransomware_files,ransomware,encryption,encrypted,corrupted,malware_infected,affected"
+
+for ts in "${RUNS[@]}"; do
+  enc=("$DIR"/*"$ts"-encr-v2.encrypted.json); enc=${enc[0]:-}
+  cor=("$DIR"/*"$ts"-encr-v2.corruption.json); cor=${cor[0]:-}
+  est=("$DIR"/*"$ts"-encr-v2.stats.json);      est=${est[0]:-}
+  mal=("$DIR"/*"$ts"-mal.json);                mal=${mal[0]:-}
+  ran=("$DIR"/*"$ts"-rans.json);               ran=${ran[0]:-}
+  fst=("$DIR"/*"$ts"-stats.json);              fst=${fst[0]:-}
+
+  encrypted=$(count '"decision": "Encrypted"' "$enc")
+  corrupted=$(count '"decision": "Corrupt"' "$cor")
+  affected=$(affected_paths "$enc" "$cor" "$ran" | wc -l | tr -d ' ')
+  encryption=$(affected_paths "$enc" "$cor" "" | wc -l | tr -d ' ')
+  # Files actually read by this run. Every detector agrees on it, so take
+  # whichever report exists: a ransomware-only run has no encryption stats and
+  # no malware report, and would otherwise come out as zero.
+  total=$(num files_analyzed "$est" || num total "$ran" || num total "$mal" || echo 0)
+
+  # Files present in the target, which is a different number. stats.json counts
+  # what is there; the detectors count what they read. Incremental runs skip
+  # unchanged files, so present > scanned is normal and worth showing.
+  present=$(num number_files "$fst" || echo 0)
+  infected=$(num infected "$mal" || echo 0)
+  suspicious=$(num suspicious "$mal" || echo 0)
+
+  families=$(grep -o '"rans_name": *"[^"]*"' "$ran" 2>/dev/null |
+             sed 's/.*"rans_name": *"//; s/"$//' | sort -u | paste -sd'/' -)
+  [[ -n "$families" ]] || families=none
+
+  # One "suspected_rans" per affected file. The scan target's own entry carries
+  # a path but no suspected_rans, so it is not counted.
+  rans_files=$(count '"suspected_rans"' "$ran")
+
+  if ((CSV)); then
+    echo "$ts,$total,$rans_files,$families,$encryption,$encrypted,$corrupted,$infected,$affected"
+    continue
+  fi
+
+  asset=$(grep -o '"asset_id": *"[^"]*"' "${mal:-$ran}" 2>/dev/null |
+          head -1 | sed 's/.*"asset_id": *"//; s/"$//')
+
+  echo
+  echo "Scan $ts"
+  [[ -n "$asset" ]] && echo "  Asset           $asset"
+  if [[ "$present" -gt "$total" ]] 2>/dev/null; then
+    printf '  Files scanned   %s   (of %s present; %s unchanged and skipped)\n' \
+           "$total" "$present" "$((present - total))"
+  else
+    printf '  Files scanned   %s\n' "$total"
+  fi
+  echo
+  echo "  FINDINGS"
+  row='    %-34s %7s   %s\n'
+  if [[ "$families" == none ]]; then
+    printf "$row" 'Ransomware' "$rans_files" 'no family named'
+  else
+    printf "$row" 'Ransomware' "$rans_files" "$families"
+  fi
+  printf "$row" 'Encryption (including corruption)' "$encryption" \
+         "$encrypted encrypted, $corrupted corrupted"
+  printf "$row" 'Malware' "$infected" "$suspicious suspicious"
+  echo
+  printf "$row" 'Affected files (unique)' "$affected" \
+         "$(pct "$affected" "$total") of files scanned"
+
+  if [[ "$families" == none && "$encrypted" -gt 0 ]]; then
+    read -r rfiles rdirs <<<"$(rans_ready "$enc")"
+    echo
+    if ((rfiles < MIN_RANS_FILES)); then
+      echo "    Note: no ransomware family was named. The engine needs at least"
+      printf '    %s encrypted files larger than %s KB before it will attribute a\n' \
+             "$MIN_RANS_FILES" "$((MIN_RANS_BYTES / 1024))"
+      printf '    family; this scan has %s. On a test corpus this small a real\n' "$rfiles"
+      echo "    infection can still report as no ransomware detected."
+      ((rdirs < MIN_RANS_DIRS)) && printf '    Those files span %s directories; attribution also weighs spread,\n    and %s or more is the level it expects.\n' \
+             "$rdirs" "$MIN_RANS_DIRS"
+      echo "    Build the test set wider rather than deeper: more affected files,"
+      echo "    spread across more directories."
+    else
+      printf '    Note: %s encrypted files over %s KB across %s directories clear the\n' \
+             "$rfiles" "$((MIN_RANS_BYTES / 1024))" "$rdirs"
+      echo "    engine's volume thresholds, so the encryption here is most likely"
+      echo "    not ransomware - for example GPG files or password-protected"
+      echo "    archives, which are encrypted by design."
+    fi
+  fi
+
+  ms=$(secs "$mal"); rs=$(secs "$ran")
+  es=$(num time_taken_s "$est") && es=$(awk -v v="$es" 'BEGIN{ printf "%.1f", v }')
+  echo
+  printf '  Scan time       malware %ss | ransomware %ss | encryption %ss\n' \
+         "${ms:-?}" "${rs:-?}" "${es:-?}"
+
+  if ((LIST)); then
+    echo
+    echo "  Affected files:"
+    affected_paths "$enc" "$cor" "$ran" | sed 's/^/    /'
+  fi
+done
+
+echo
